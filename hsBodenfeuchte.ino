@@ -11,16 +11,18 @@
 #define PIN_LED 3
 #define PIN_CNT 2
 
-uint64_t hibernate = MINUTES(2);
+//uint64_t hibernate = MINUTES(2);
+uint64_t hibernate = SECONDS(5);
 unsigned long humValue = 0;
 unsigned long oldValue = 0;
 unsigned long tmpValue = 0;
+unsigned long tmp2Value = 0;
 unsigned long maxHumValue = 0;
 unsigned int humPreCounter = 0;
 unsigned int humAverageCounter = 0;
 unsigned int advertiseLevel = 0;
 bool humValid = false;
-bool finished = true;
+bool finished = false;
 bool advertising = false;
 bool quit = false;
 bool cntIntEnable = false;
@@ -30,6 +32,8 @@ Timer timer;
 
 float readBatteryVoltage() {
   int sensorValue = analogRead(PIN_BATT);
+  Serial.print("Batteriespannung: ");
+  Serial.println(sensorValue * (3.3 / 1023.0));
   return sensorValue * (3.3 / 1023.0);
 }
 
@@ -38,31 +42,41 @@ void startHumidity() {
   humAverageCounter = 0;
   humValid = false;
   humValue = 0;
-  oldValue = 0xFFFFFFFF;
+  oldValue = 0;
   digitalWrite(PIN_PWR, LOW);
   cntIntEnable = true;
+  Serial.println("Messung gestartet");
 }
 
 void stopHumidity() {
   cntIntEnable = false;
   digitalWrite(PIN_PWR, HIGH);
+  Serial.println("Messung beendet");
 }
 
 int readHumidity(uint32_t ulPin) {
+  tmpValue = micros(); 
+  
   //Einschwingvorgang
   if (humPreCounter++ < 10 || !cntIntEnable) {
     return 0;
   }
-  tmpValue = micros();
-  if(tmpValue > oldValue) {
-    tmpValue = tmpValue - oldValue;
+  
+  //erste Messung
+  if (humAverageCounter++ == 0) {  
+    oldValue = tmpValue;
+    return 0;
+  }
+  
+  if (tmpValue > oldValue) { //nur wenn kein Überlauf aufgetreten
+    tmp2Value = tmpValue - oldValue;
     //averaging
     if (humValue == 0) {
-      humValue = tmpValue;
+      humValue = tmp2Value;
     } else {
-      humValue = (178 * tmpValue + (256 - 178) * humValue )/ 256;
+      humValue = (178 * tmp2Value + (256 - 178) * humValue )/ 256;
     }
-    if(humAverageCounter++ > 10) {
+    if (humAverageCounter++ > 10) {
       stopHumidity();
       humValid = true;
       if (maxHumValue < humValue) {
@@ -75,6 +89,7 @@ int readHumidity(uint32_t ulPin) {
 }
 
 void setup() {
+  Serial.begin(9600);
   pinMode(PIN_PWR, OUTPUT);
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
@@ -86,6 +101,7 @@ void setup() {
 }
 
 void loop() {
+  //Serial.println("Schleife gestartet");
   //kann vielleicht entfallen, wenn pinWoke nicht verwendet werden soll
   if (RFduino_pinWoke(PIN_CNT)) {
     RFduino_resetPinWake(PIN_CNT);
@@ -105,6 +121,8 @@ void loop() {
     advertiseLevel = 0;
     RFduinoBLE.txPowerLevel = -20;
     snprintf(sendBuffer, 128, "humValue: %lu, humMaxValue: %lu, battery: %f\n", humValue, maxHumValue, battVoltage); 
+    Serial.println(sendBuffer);
+    Serial.println("waiting for connect");
     RFduinoBLE.begin();
     RFduinoBLE.send(sendBuffer, strlen(sendBuffer));
     timer.setTimeout(2000);
@@ -117,6 +135,7 @@ void loop() {
       RFduinoBLE.txPowerLevel = -20 + advertiseLevel * 4;
     } else {
       advertising = false;
+      Serial.println("Sending Timeout");
       RFduinoBLE.end();
       finished = true;
     }
@@ -126,6 +145,7 @@ void loop() {
     advertising = false;
     quit = false;
     RFduinoBLE.end();
+    Serial.println("Sending successful");
     finished = true;
   }
 }
