@@ -11,29 +11,43 @@
 #define PIN_LED 3
 #define PIN_CNT 2
 
+#define SEND_TIMEOUT 2000
+#define DEBUG
+
+typedef struct __attribute__((packed)) {
+  unsigned long humValue;
+  unsigned long maxHumValue;
+  float battVoltage;
+} sendStruct;
+
 //uint64_t hibernate = MINUTES(2);
 uint64_t hibernate = SECONDS(5);
-unsigned long humValue = 0;
+uint64_t tmpHibernate;
 unsigned long oldValue = 0;
 unsigned long tmpValue = 0;
 unsigned long tmp2Value = 0;
-unsigned long maxHumValue = 0;
 unsigned int humPreCounter = 0;
 unsigned int humAverageCounter = 0;
 unsigned int advertiseLevel = 0;
+unsigned int timeoutCounter = 0;
 bool humValid = false;
 bool finished = false;
 bool advertising = false;
 bool quit = false;
 bool cntIntEnable = false;
-float battVoltage = 0;
+#ifdef DEBUG
 char sendBuffer[128];
+#endif
 Timer timer;
+
+sendStruct messwerte;
 
 float readBatteryVoltage() {
   int sensorValue = analogRead(PIN_BATT);
+#ifdef DEBUG
   Serial.print("Batteriespannung: ");
   Serial.println(sensorValue * (3.3 / 1023.0));
+#endif 
   return sensorValue * (3.3 / 1023.0);
 }
 
@@ -41,17 +55,22 @@ void startHumidity() {
   humPreCounter = 0;
   humAverageCounter = 0;
   humValid = false;
-  humValue = 0;
+  messwerte.humValue = 0;
   oldValue = 0;
   digitalWrite(PIN_PWR, LOW);
+  digitalWrite(PIN_LED, HIGH);
   cntIntEnable = true;
+#ifdef DEBUG
   Serial.println("Messung gestartet");
+#endif
 }
 
 void stopHumidity() {
   cntIntEnable = false;
   digitalWrite(PIN_PWR, HIGH);
+#ifdef DEBUG
   Serial.println("Messung beendet");
+#endif
 }
 
 int readHumidity(uint32_t ulPin) {
@@ -71,16 +90,16 @@ int readHumidity(uint32_t ulPin) {
   if (tmpValue > oldValue) { //nur wenn kein Überlauf aufgetreten
     tmp2Value = tmpValue - oldValue;
     //averaging
-    if (humValue == 0) {
-      humValue = tmp2Value;
+    if (messwerte.humValue == 0) {
+      messwerte.humValue = tmp2Value;
     } else {
-      humValue = (178 * tmp2Value + (256 - 178) * humValue )/ 256;
+      messwerte.humValue = (178 * tmp2Value + (256 - 178) * messwerte.humValue )/ 256;
     }
     if (humAverageCounter++ > 10) {
       stopHumidity();
       humValid = true;
-      if (maxHumValue < humValue) {
-        maxHumValue = humValue;
+      if (messwerte.maxHumValue < messwerte.humValue) {
+        messwerte.maxHumValue = messwerte.humValue;
       }
     }
   }
@@ -89,7 +108,9 @@ int readHumidity(uint32_t ulPin) {
 }
 
 void setup() {
+#ifdef DEBUG
   Serial.begin(9600);
+#endif
   pinMode(PIN_PWR, OUTPUT);
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
@@ -97,6 +118,7 @@ void setup() {
   pinMode(PIN_CNT, INPUT);
   RFduino_pinWake(PIN_CNT, HIGH); 
   RFduino_pinWakeCallback(PIN_CNT, HIGH, readHumidity);
+  messwerte.maxHumValue = 0;
   startHumidity();
 }
 
@@ -110,22 +132,25 @@ void loop() {
   if (finished) {
     finished = false;
     digitalWrite(PIN_LED, LOW);
-    RFduino_ULPDelay(hibernate);
-    digitalWrite(PIN_LED, HIGH);
+    RFduino_ULPDelay(hibernate);  
     startHumidity();
-    battVoltage = readBatteryVoltage();
+    messwerte.battVoltage = readBatteryVoltage();
   }
   
   if (humValid) {
     humValid = false;
-    advertiseLevel = 0;
-    RFduinoBLE.txPowerLevel = -20;
-    snprintf(sendBuffer, 128, "humValue: %lu, humMaxValue: %lu, battery: %f\n", humValue, maxHumValue, battVoltage); 
+    if (advertiseLevel > 0)
+      advertiseLevel--;  //eine Stufe runterschalten
+    RFduinoBLE.txPowerLevel = -20 + advertiseLevel * 4;
+#ifdef DEBUG
+    snprintf(sendBuffer, 128, "humValue: %lu, humMaxValue: %lu, battery: %f\n",
+              messwerte.humValue, messwerte.maxHumValue, messwerte.battVoltage); 
     Serial.println(sendBuffer);
     Serial.println("waiting for connect");
+#endif
     RFduinoBLE.begin();
-    RFduinoBLE.send(sendBuffer, strlen(sendBuffer));
-    timer.setTimeout(2000);
+    RFduinoBLE.send((char*)&messwerte, sizeof(messwerte));
+    timer.setTimeout(SEND_TIMEOUT);
     advertising = true;
   }
   
@@ -133,9 +158,17 @@ void loop() {
     if (advertiseLevel < 7) {
       advertiseLevel++;
       RFduinoBLE.txPowerLevel = -20 + advertiseLevel * 4;
+      timer.setTimeout(SEND_TIMEOUT);
     } else {
       advertising = false;
+      if (timeoutCounter < 3) {
+        timeoutCounter++;
+        tmpHibernate = hibernate;
+        hibernate = SECONDS(5);
+      }
+#ifdef DEBUG
       Serial.println("Sending Timeout");
+#endif
       RFduinoBLE.end();
       finished = true;
     }
@@ -144,17 +177,33 @@ void loop() {
   if (advertising && quit) {
     advertising = false;
     quit = false;
+    if (timeoutCounter > 0) {
+      timeoutCounter = 0;
+      hibernate = tmpHibernate;
+    }
     RFduinoBLE.end();
+#ifdef DEBUG
     Serial.println("Sending successful");
+#endif
     finished = true;
   }
 }
 
 void RFduinoBLE_onReceive(char *data, int len) {
-  if (memcmp(data, "OK", 2)) {
+  if (strncmp(data, "OK", 2)) {
+#ifdef DEBUG
+    Serial.println("receive OK");
+#endif
     quit = true;
-  } else if (memcmp(data, "Pause:", 6)) {
-    hibernate = MINUTES(atoi(data + 7));
+  } else if (strncmp(data, "P", 1)) {
+    char *enddata = strstr(data, "\n");
+    enddata = '\0';
+    hibernate = MINUTES(atoi(data + 1));
+    timeoutCounter = 0;
+#ifdef DEBUG
+    Serial.print("receive P: ");
+    Serial.println(atoi(data + 1));
+#endif
     quit = true;
   }
 }
